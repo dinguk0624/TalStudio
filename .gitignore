@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.env
 
 image-generator/output/*
 !image-generator/output/.gitkeep
@@ -11,3 +12,4 @@ music-generator/output/*
 
 *.png
 *.wav
+*.mp3

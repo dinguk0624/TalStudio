@@ -3,26 +3,12 @@ import random
 import uuid
 
 import gradio as gr
-import soundfile as sf
 import torch
-
-from diffusers import StableDiffusionPipeline
-from transformers import AutoProcessor, MusicgenForConditionalGeneration
-
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-IMAGE_OUTPUT = os.path.join(
-    ROOT,
-    "image-generator",
-    "output"
-)
-
-MUSIC_OUTPUT = os.path.join(
-    ROOT,
-    "music-generator",
-    "output"
-)
+IMAGE_OUTPUT = os.path.join(ROOT, "image-generator", "output")
+MUSIC_OUTPUT = os.path.join(ROOT, "music-generator", "output")
 
 os.makedirs(IMAGE_OUTPUT, exist_ok=True)
 os.makedirs(MUSIC_OUTPUT, exist_ok=True)
@@ -32,152 +18,137 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMAGE_MODEL = "runwayml/stable-diffusion-v1-5"
 MUSIC_MODEL = "facebook/musicgen-small"
 
+# Lazy-loaded model handles (None until first use)
+_image_pipe = None
+_music_processor = None
+_music_model = None
 
 print(f"Using device: {DEVICE}")
-print("Loading image model...")
-
-image_dtype = (
-    torch.float16
-    if DEVICE == "cuda"
-    else torch.float32
-)
-
-image_pipe = StableDiffusionPipeline.from_pretrained(
-    IMAGE_MODEL,
-    torch_dtype=image_dtype
-)
-
-image_pipe = image_pipe.to(DEVICE)
-
-print("Loading music model...")
-
-music_processor = AutoProcessor.from_pretrained(
-    MUSIC_MODEL
-)
-
-music_model = MusicgenForConditionalGeneration.from_pretrained(
-    MUSIC_MODEL
-)
-
-music_model = music_model.to(DEVICE)
-
-print("Models loaded successfully.")
+print("Models will load on first generate (lazy load).")
 
 
-def generate_image(
-    prompt,
-    negative_prompt,
-    steps,
-    guidance,
-    seed
-):
+def _get_image_pipe():
+    """Load Stable Diffusion only when image generation is requested."""
+    global _image_pipe
+    if _image_pipe is not None:
+        return _image_pipe
+
+    from diffusers import StableDiffusionPipeline
+
+    print("Loading image model...")
+    image_dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+    pipe = StableDiffusionPipeline.from_pretrained(
+        IMAGE_MODEL,
+        torch_dtype=image_dtype,
+    )
+    pipe = pipe.to(DEVICE)
+    _image_pipe = pipe
+    print("Image model loaded.")
+    return _image_pipe
+
+
+def _get_music_model():
+    """Load MusicGen only when music generation is requested."""
+    global _music_processor, _music_model
+    if _music_model is not None:
+        return _music_processor, _music_model
+
+    from transformers import AutoProcessor, MusicgenForConditionalGeneration
+
+    print("Loading music model...")
+    processor = AutoProcessor.from_pretrained(MUSIC_MODEL)
+    model = MusicgenForConditionalGeneration.from_pretrained(MUSIC_MODEL)
+    model = model.to(DEVICE)
+    _music_processor = processor
+    _music_model = model
+    print("Music model loaded.")
+    return _music_processor, _music_model
+
+
+def generate_image(prompt, negative_prompt, steps, guidance, seed):
     if not prompt or not prompt.strip():
         raise gr.Error("Please enter an image prompt.")
 
     if seed == -1:
         seed = random.randint(0, 2**31 - 1)
-
     seed = int(seed)
 
-    generator = torch.Generator(
-        device=DEVICE
-    ).manual_seed(seed)
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
 
     try:
-        result = image_pipe(
+        pipe = _get_image_pipe()
+        result = pipe(
             prompt=prompt,
-            negative_prompt=negative_prompt,
+            negative_prompt=negative_prompt or None,
             num_inference_steps=int(steps),
             guidance_scale=float(guidance),
-            generator=generator
+            generator=generator,
         )
     except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         raise gr.Error(
-            "Out of GPU memory. Try lowering steps or restarting the app."
+            "Out of GPU memory. Try lowering steps, using a shorter prompt, "
+            "or restarting the app."
         )
 
     image = result.images[0]
 
-    if result.nsfw_content_detected and result.nsfw_content_detected[0]:
+    nsfw = getattr(result, "nsfw_content_detected", None)
+    if nsfw and nsfw[0]:
         raise gr.Error(
             "The generated image was flagged by the safety checker. "
             "Try a different prompt."
         )
 
     output_path = os.path.join(
-        IMAGE_OUTPUT,
-        f"talstudio_image_{uuid.uuid4().hex}.png"
+        IMAGE_OUTPUT, f"talstudio_image_{uuid.uuid4().hex}.png"
     )
-
     image.save(output_path)
-
     return image, output_path, seed
 
 
-def generate_music(
-    prompt,
-    duration,
-    seed
-):
+def generate_music(prompt, duration, seed):
     if not prompt or not prompt.strip():
         raise gr.Error("Please enter a music prompt.")
 
     if seed == -1:
         seed = random.randint(0, 2**31 - 1)
-
     seed = int(seed)
 
     torch.manual_seed(seed)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    inputs = music_processor(
-        text=[prompt],
-        padding=True,
-        return_tensors="pt"
-    )
-
-    inputs = {
-        key: value.to(DEVICE)
-        for key, value in inputs.items()
-    }
-
-    max_new_tokens = int(duration) * 50
-
     try:
-        audio_values = music_model.generate(
+        processor, model = _get_music_model()
+        inputs = processor(text=[prompt], padding=True, return_tensors="pt")
+        inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
+
+        max_new_tokens = int(duration) * 50
+        audio_values = model.generate(
             **inputs,
             do_sample=True,
-            max_new_tokens=max_new_tokens
+            max_new_tokens=max_new_tokens,
         )
     except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         raise gr.Error(
             "Out of GPU memory. Try a shorter duration or restarting the app."
         )
 
-    audio = audio_values[0].detach().cpu().numpy()
+    import soundfile as sf
 
+    audio = audio_values[0].detach().cpu().numpy()
     if audio.ndim == 2:
         audio = audio.T
 
-    sample_rate = (
-        music_model.config.audio_encoder.sampling_rate
-    )
-
+    sample_rate = model.config.audio_encoder.sampling_rate
     output_path = os.path.join(
-        MUSIC_OUTPUT,
-        f"talstudio_music_{uuid.uuid4().hex}.wav"
+        MUSIC_OUTPUT, f"talstudio_music_{uuid.uuid4().hex}.wav"
     )
-
-    sf.write(
-        output_path,
-        audio,
-        sample_rate
-    )
-
+    sf.write(output_path, audio, sample_rate)
     return output_path, output_path, seed
 
 
@@ -214,93 +185,60 @@ css = """
 with gr.Blocks(
     css=css,
     theme=gr.themes.Soft(),
-    title="TalStudio"
+    title="TalStudio",
 ) as demo:
 
-    gr.Markdown(
-        "# TalStudio",
-        elem_id="title"
-    )
-
+    gr.Markdown("# TalStudio", elem_id="title")
     gr.Markdown(
         "A local AI studio for generating images and music.",
-        elem_id="subtitle"
+        elem_id="subtitle",
     )
 
     with gr.Tabs():
-
         with gr.Tab("Image Generator"):
-
             gr.Markdown("## Image Generator")
-
             gr.Markdown(
-                "Create images from original text prompts "
-                "using a local AI model."
+                "Create images from text prompts using a local Stable Diffusion model. "
+                "The model loads on first use."
             )
 
             with gr.Row():
-
                 image_prompt = gr.Textbox(
                     label="Prompt",
                     placeholder=(
                         "Example: a futuristic city at night, "
                         "neon lights, cinematic lighting"
                     ),
-                    lines=4
+                    lines=4,
                 )
-
                 image_negative_prompt = gr.Textbox(
                     label="Negative Prompt",
                     placeholder=(
                         "Example: blurry, low quality, "
                         "watermark, text, logo"
                     ),
-                    lines=4
+                    lines=4,
                 )
 
             with gr.Row():
-
                 image_steps = gr.Slider(
-                    minimum=10,
-                    maximum=50,
-                    value=25,
-                    step=1,
-                    label="Steps"
+                    minimum=10, maximum=50, value=25, step=1, label="Steps"
                 )
-
                 image_guidance = gr.Slider(
-                    minimum=1,
-                    maximum=20,
-                    value=7.5,
-                    step=0.5,
-                    label="Guidance Scale"
+                    minimum=1, maximum=20, value=7.5, step=0.5, label="Guidance Scale"
                 )
-
                 image_seed = gr.Number(
-                    value=-1,
-                    precision=0,
-                    label="Seed (-1 = random)"
+                    value=-1, precision=0, label="Seed (-1 = random)"
                 )
 
             image_button = gr.Button(
                 "Generate Image",
                 variant="primary",
-                elem_classes="generate-button"
+                elem_classes="generate-button",
             )
-
-            image_output = gr.Image(
-                label="Generated Image",
-                type="pil"
-            )
-
-            image_file = gr.File(
-                label="Saved Image"
-            )
-
-            image_used_seed = gr.Number(
-                label="Used Seed",
-                interactive=False
-            )
+            image_output = gr.Image(label="Generated Image", type="pil")
+            image_file = gr.File(label="Saved Image")
+            image_used_seed = gr.Number(label="Used Seed", interactive=False)
 
             image_button.click(
                 fn=generate_image,
@@ -309,21 +247,16 @@ with gr.Blocks(
                     image_negative_prompt,
                     image_steps,
                     image_guidance,
-                    image_seed
+                    image_seed,
                 ],
-                outputs=[
-                    image_output,
-                    image_file,
-                    image_used_seed
-                ]
+                outputs=[image_output, image_file, image_used_seed],
             )
 
         with gr.Tab("Music Generator"):
-
             gr.Markdown("## Music Generator")
-
             gr.Markdown(
-                "Create short music clips from original text prompts."
+                "Create short music clips from text prompts using MusicGen. "
+                "The model loads on first use."
             )
 
             music_prompt = gr.Textbox(
@@ -332,58 +265,37 @@ with gr.Blocks(
                     "Example: calm lo-fi instrumental with soft piano, "
                     "warm bass and gentle drums"
                 ),
-                lines=4
+                lines=4,
             )
 
             with gr.Row():
-
                 music_duration = gr.Slider(
-                    minimum=4,
-                    maximum=16,
-                    value=8,
-                    step=1,
-                    label="Duration (seconds)"
+                    minimum=4, maximum=16, value=8, step=1, label="Duration (seconds)"
                 )
-
                 music_seed = gr.Number(
-                    value=-1,
-                    precision=0,
-                    label="Seed (-1 = random)"
+                    value=-1, precision=0, label="Seed (-1 = random)"
                 )
 
             music_button = gr.Button(
                 "Generate Music",
                 variant="primary",
-                elem_classes="generate-button"
+                elem_classes="generate-button",
             )
-
-            music_output = gr.Audio(
-                label="Generated Music",
-                type="filepath"
-            )
-
-            music_file = gr.File(
-                label="Saved Audio File"
-            )
-
-            music_used_seed = gr.Number(
-                label="Used Seed",
-                interactive=False
-            )
+            music_output = gr.Audio(label="Generated Music", type="filepath")
+            music_file = gr.File(label="Saved Audio File")
+            music_used_seed = gr.Number(label="Used Seed", interactive=False)
 
             music_button.click(
                 fn=generate_music,
-                inputs=[
-                    music_prompt,
-                    music_duration,
-                    music_seed
-                ],
-                outputs=[
-                    music_output,
-                    music_file,
-                    music_used_seed
-                ]
+                inputs=[music_prompt, music_duration, music_seed],
+                outputs=[music_output, music_file, music_used_seed],
             )
 
 
-demo.launch()
+if __name__ == "__main__":
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        share=False,
+        show_error=True,
+    )

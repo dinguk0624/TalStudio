@@ -1,5 +1,6 @@
 import os
 import random
+import uuid
 
 import gradio as gr
 import soundfile as sf
@@ -43,8 +44,7 @@ image_dtype = (
 
 image_pipe = StableDiffusionPipeline.from_pretrained(
     IMAGE_MODEL,
-    torch_dtype=image_dtype,
-    safety_checker=None
+    torch_dtype=image_dtype
 )
 
 image_pipe = image_pipe.to(DEVICE)
@@ -83,27 +83,31 @@ def generate_image(
         device=DEVICE
     ).manual_seed(seed)
 
-    result = image_pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        num_inference_steps=int(steps),
-        guidance_scale=float(guidance),
-        generator=generator
-    )
+    try:
+        result = image_pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            num_inference_steps=int(steps),
+            guidance_scale=float(guidance),
+            generator=generator
+        )
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise gr.Error(
+            "Out of GPU memory. Try lowering steps or restarting the app."
+        )
 
     image = result.images[0]
 
-    existing_files = [
-        file
-        for file in os.listdir(IMAGE_OUTPUT)
-        if file.lower().endswith(".png")
-    ]
-
-    file_number = len(existing_files) + 1
+    if result.nsfw_content_detected and result.nsfw_content_detected[0]:
+        raise gr.Error(
+            "The generated image was flagged by the safety checker. "
+            "Try a different prompt."
+        )
 
     output_path = os.path.join(
         IMAGE_OUTPUT,
-        f"talstudio_image_{file_number}.png"
+        f"talstudio_image_{uuid.uuid4().hex}.png"
     )
 
     image.save(output_path)
@@ -142,11 +146,17 @@ def generate_music(
 
     max_new_tokens = int(duration) * 50
 
-    audio_values = music_model.generate(
-        **inputs,
-        do_sample=True,
-        max_new_tokens=max_new_tokens
-    )
+    try:
+        audio_values = music_model.generate(
+            **inputs,
+            do_sample=True,
+            max_new_tokens=max_new_tokens
+        )
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise gr.Error(
+            "Out of GPU memory. Try a shorter duration or restarting the app."
+        )
 
     audio = audio_values[0].detach().cpu().numpy()
 
@@ -157,17 +167,9 @@ def generate_music(
         music_model.config.audio_encoder.sampling_rate
     )
 
-    existing_files = [
-        file
-        for file in os.listdir(MUSIC_OUTPUT)
-        if file.lower().endswith(".wav")
-    ]
-
-    file_number = len(existing_files) + 1
-
     output_path = os.path.join(
         MUSIC_OUTPUT,
-        f"talstudio_music_{file_number}.wav"
+        f"talstudio_music_{uuid.uuid4().hex}.wav"
     )
 
     sf.write(

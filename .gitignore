@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+image-generator/output/*
+!image-generator/output/.gitkeep
+
+music-generator/output/*
+!music-generator/output/.gitkeep
+
+*.png
+*.wav

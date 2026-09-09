@@ -1,0 +1,35 @@
+# TalStudio
+
+Local Gradio app for generating images (Stable Diffusion v1.5) and short music
+clips (MusicGen small) from text prompts.
+
+## Requirements
+
+- Python 3.10+
+- A CUDA GPU is strongly recommended (image/music generation will run on CPU
+  but will be slow). ~8GB VRAM is a reasonable minimum since both models are
+  loaded into memory at startup.
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## Run
+
+```bash
+python app.py
+```
+
+Gradio will print a local URL (default `http://127.0.0.1:7860`) to open in
+your browser.
+
+## Notes
+
+- Generated images and audio are saved under `image-generator/output/` and
+  `music-generator/output/` with unique filenames, and are not committed to
+  the repo (see `.gitignore`).
+- The Stable Diffusion pipeline uses its default safety checker.

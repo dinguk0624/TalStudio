@@ -38,8 +38,8 @@ Gradio will serve at `http://127.0.0.1:7860` by default.
   `music-generator/output/` with unique filenames (not committed).
 - Both models use `float16` on CUDA to reduce VRAM usage.
 - Stable Diffusion has attention slicing enabled for lower memory.
+- The Stable Diffusion pipeline uses its default safety checker.
 - First generation per modality will take longer while the model downloads/loads.
-- Safety checker is currently disabled for smoother generation (you can re-enable it in code if preferred).
 
 ## License
 

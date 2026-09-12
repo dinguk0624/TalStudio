@@ -40,8 +40,6 @@ def _get_image_pipe():
     pipe = StableDiffusionPipeline.from_pretrained(
         IMAGE_MODEL,
         torch_dtype=DTYPE,
-        safety_checker=None,  # optional: can re-enable if preferred
-        requires_safety_checker=False,
     )
     pipe = pipe.to(DEVICE)
 
@@ -108,7 +106,6 @@ def generate_image(prompt, negative_prompt, steps, guidance, seed):
 
     image = result.images[0]
 
-    # Safety checker is disabled above; if re-enabled later, keep this check
     nsfw = getattr(result, "nsfw_content_detected", None)
     if nsfw and nsfw[0]:
         raise gr.Error(

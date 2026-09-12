@@ -14,6 +14,7 @@ os.makedirs(IMAGE_OUTPUT, exist_ok=True)
 os.makedirs(MUSIC_OUTPUT, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 IMAGE_MODEL = "runwayml/stable-diffusion-v1-5"
 MUSIC_MODEL = "facebook/musicgen-small"
@@ -23,7 +24,7 @@ _image_pipe = None
 _music_processor = None
 _music_model = None
 
-print(f"Using device: {DEVICE}")
+print(f"Using device: {DEVICE} (dtype: {DTYPE})")
 print("Models will load on first generate (lazy load).")
 
 
@@ -35,13 +36,21 @@ def _get_image_pipe():
 
     from diffusers import StableDiffusionPipeline
 
-    print("Loading image model...")
-    image_dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+    print("Loading image model (Stable Diffusion v1.5)...")
     pipe = StableDiffusionPipeline.from_pretrained(
         IMAGE_MODEL,
-        torch_dtype=image_dtype,
+        torch_dtype=DTYPE,
+        safety_checker=None,  # optional: can re-enable if preferred
+        requires_safety_checker=False,
     )
     pipe = pipe.to(DEVICE)
+
+    # Lower VRAM usage
+    try:
+        pipe.enable_attention_slicing()
+    except Exception:
+        pass
+
     _image_pipe = pipe
     print("Image model loaded.")
     return _image_pipe
@@ -55,9 +64,12 @@ def _get_music_model():
 
     from transformers import AutoProcessor, MusicgenForConditionalGeneration
 
-    print("Loading music model...")
+    print("Loading music model (MusicGen small)...")
     processor = AutoProcessor.from_pretrained(MUSIC_MODEL)
-    model = MusicgenForConditionalGeneration.from_pretrained(MUSIC_MODEL)
+    model = MusicgenForConditionalGeneration.from_pretrained(
+        MUSIC_MODEL,
+        torch_dtype=DTYPE,
+    )
     model = model.to(DEVICE)
     _music_processor = processor
     _music_model = model
@@ -91,9 +103,12 @@ def generate_image(prompt, negative_prompt, steps, guidance, seed):
             "Out of GPU memory. Try lowering steps, using a shorter prompt, "
             "or restarting the app."
         )
+    except Exception as e:
+        raise gr.Error(f"Image generation failed: {str(e)}")
 
     image = result.images[0]
 
+    # Safety checker is disabled above; if re-enabled later, keep this check
     nsfw = getattr(result, "nsfw_content_detected", None)
     if nsfw and nsfw[0]:
         raise gr.Error(
@@ -125,24 +140,34 @@ def generate_music(prompt, duration, seed):
         inputs = processor(text=[prompt], padding=True, return_tensors="pt")
         inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
 
-        max_new_tokens = int(duration) * 50
-        audio_values = model.generate(
-            **inputs,
-            do_sample=True,
-            max_new_tokens=max_new_tokens,
-        )
+        # MusicGen ≈ 50 tokens per second of audio
+        max_new_tokens = max(50, int(duration) * 50)
+
+        with torch.inference_mode():
+            audio_values = model.generate(
+                **inputs,
+                do_sample=True,
+                guidance_scale=3.0,
+                max_new_tokens=max_new_tokens,
+            )
     except torch.cuda.OutOfMemoryError:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         raise gr.Error(
             "Out of GPU memory. Try a shorter duration or restarting the app."
         )
+    except Exception as e:
+        raise gr.Error(f"Music generation failed: {str(e)}")
 
     import soundfile as sf
 
-    audio = audio_values[0].detach().cpu().numpy()
+    # audio_values shape: (batch, channels, samples) or (batch, samples)
+    audio = audio_values[0].detach().cpu().float().numpy()
+
     if audio.ndim == 2:
-        audio = audio.T
+        # (channels, samples) -> (samples, channels) for soundfile
+        if audio.shape[0] <= 2:  # stereo/mono channels first
+            audio = audio.T
 
     sample_rate = model.config.audio_encoder.sampling_rate
     output_path = os.path.join(
@@ -190,7 +215,8 @@ with gr.Blocks(
 
     gr.Markdown("# TalStudio", elem_id="title")
     gr.Markdown(
-        "A local AI studio for generating images and music.",
+        "A local AI studio for generating images and music.\n"
+        "Models load only when you first click Generate (saves RAM/VRAM).",
         elem_id="subtitle",
     )
 
